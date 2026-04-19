@@ -114,15 +114,17 @@ def get_cam(tensor: torch.Tensor, class_idx: int) -> np.ndarray:
 
     def hook(module, input, output):
         nonlocal activations
-        activations = output.detach()
+        activations = output.detach()  # (1, C, H, W)
 
-    handle = model.blocks[-1][-1].conv_pwl.register_forward_hook(hook)
+    # Hook the last conv block output (before global avg pool)
+    handle = model.conv_head.register_forward_hook(hook)
     with torch.no_grad():
         model(tensor)
     handle.remove()
 
-    classifier_weights = model.classifier.weight[class_idx].detach()
-    cam = (classifier_weights[:, None, None] * activations[0]).sum(dim=0)
+    # activations: (1, 1536, H, W) — matches classifier weight dim
+    classifier_weights = model.classifier.weight[class_idx].detach()  # (1536,)
+    cam = (classifier_weights[:, None, None] * activations[0]).sum(dim=0)  # (H, W)
     cam = F.relu(cam)
     cam = cam - cam.min()
     cam = cam / (cam.max() + 1e-8)
