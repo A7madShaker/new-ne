@@ -1,14 +1,18 @@
 import io
+import base64
 import torch
 import timm
+import numpy as np
 from PIL import Image
 from fastapi import FastAPI, File, UploadFile, HTTPException
+from fastapi.responses import JSONResponse
 from torchvision import transforms
+import torch.nn.functional as F
 
 # ── App ────────────────────────────────────────────────────────────────────────
 app = FastAPI(title="Tooth Classification API", version="1.0.0")
 
-# ── Classes ────────────────────────────────────────────────────────────────────
+# ── Classes & Recommendations ──────────────────────────────────────────────────
 CLASSES = {
     0: "Data caries",
     1: "Gingivitis",
@@ -111,23 +115,83 @@ transform = transforms.Compose([
                          std=[0.229, 0.224, 0.225]),
 ])
 
+# ── Grad-CAM ───────────────────────────────────────────────────────────────────
+class GradCAM:
+    def __init__(self, model):
+        self.model = model
+        self.gradients = None
+        self.activations = None
+        # Hook on the last conv block of EfficientNet-B3
+        target_layer = model.blocks[-1][-1].conv_pwl
+        target_layer.register_forward_hook(self._save_activation)
+        target_layer.register_backward_hook(self._save_gradient)
+
+    def _save_activation(self, module, input, output):
+        self.activations = output.detach()
+
+    def _save_gradient(self, module, grad_input, grad_output):
+        self.gradients = grad_output[0].detach()
+
+    def generate(self, tensor, class_idx):
+        self.model.zero_grad()
+        output = self.model(tensor)
+        output[0, class_idx].backward()
+
+        # Global average pooling over gradients
+        weights = self.gradients.mean(dim=(2, 3), keepdim=True)
+        cam = (weights * self.activations).sum(dim=1, keepdim=True)
+        cam = F.relu(cam)
+
+        # Normalize to [0, 1]
+        cam = cam - cam.min()
+        cam = cam / (cam.max() + 1e-8)
+        return cam.squeeze().cpu().numpy()
+
+
+gradcam = GradCAM(model)
+
+
+def apply_heatmap(original_image: Image.Image, cam: np.ndarray) -> str:
+    """Overlay Grad-CAM heatmap on original image and return base64 string."""
+    import cv2
+
+    # Resize CAM to original image size
+    orig_w, orig_h = original_image.size
+    cam_resized = np.uint8(255 * cam)
+    cam_resized = cv2.resize(cam_resized, (orig_w, orig_h))
+
+    # Apply colormap
+    heatmap = cv2.applyColorMap(cam_resized, cv2.COLORMAP_JET)
+    heatmap = cv2.cvtColor(heatmap, cv2.COLOR_BGR2RGB)
+
+    # Blend with original
+    orig_array = np.array(original_image.convert("RGB"))
+    blended = cv2.addWeighted(orig_array, 0.5, heatmap, 0.5, 0)
+
+    # Encode to base64
+    _, buffer = cv2.imencode(".jpg", cv2.cvtColor(blended, cv2.COLOR_RGB2BGR))
+    return base64.b64encode(buffer).decode("utf-8")
+
+
 # ── Helpers ────────────────────────────────────────────────────────────────────
-def predict(image_bytes: bytes):
+def run_predict(image_bytes: bytes, with_gradcam: bool = False):
     image = Image.open(io.BytesIO(image_bytes)).convert("RGB")
     tensor = transform(image).unsqueeze(0).to(device)
 
-    with torch.no_grad():
+    if with_gradcam:
+        tensor.requires_grad_()
+
+    with torch.set_grad_enabled(with_gradcam):
         logits = model(tensor)
-        probs  = torch.softmax(logits, dim=1)[0]
+        probs = torch.softmax(logits, dim=1)[0]
 
-    top_idx   = int(probs.argmax())
+    top_idx = int(probs.argmax())
     top_label = CLASSES[top_idx]
-    top_conf  = float(probs[top_idx])
-
+    top_conf = float(probs[top_idx])
     all_probs = {CLASSES[i]: round(float(probs[i]), 4) for i in range(NUM_CLASSES)}
-    clinical  = RECOMMENDATIONS[top_label]
+    clinical = RECOMMENDATIONS[top_label]
 
-    return {
+    result = {
         "prediction": top_label,
         "confidence": round(top_conf, 4),
         "severity": clinical["severity"],
@@ -135,15 +199,28 @@ def predict(image_bytes: bytes):
         "probabilities": all_probs,
     }
 
+    if with_gradcam:
+        cam = gradcam.generate(tensor, top_idx)
+        result["gradcam_image"] = f"data:image/jpeg;base64,{apply_heatmap(image, cam)}"
+
+    return result
+
+
 # ── Routes ─────────────────────────────────────────────────────────────────────
 @app.get("/")
 def root():
     return {"message": "Tooth Classification API is running 🦷"}
 
+
 @app.post("/predict")
 async def classify(file: UploadFile = File(...)):
     if not file.content_type.startswith("image/"):
         raise HTTPException(status_code=400, detail="File must be an image.")
-    image_bytes = await file.read()
-    result = predict(image_bytes)
-    return result
+    return run_predict(await file.read(), with_gradcam=False)
+
+
+@app.post("/predict-gradcam")
+async def classify_gradcam(file: UploadFile = File(...)):
+    if not file.content_type.startswith("image/"):
+        raise HTTPException(status_code=400, detail="File must be an image.")
+    return run_predict(await file.read(), with_gradcam=True)
