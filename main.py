@@ -8,10 +8,8 @@ from fastapi import FastAPI, File, UploadFile, HTTPException
 from torchvision import transforms
 import torch.nn.functional as F
 
-# ── App ────────────────────────────────────────────────────────────────────────
 app = FastAPI(title="Tooth Classification API", version="1.0.0")
 
-# ── Classes & Recommendations ──────────────────────────────────────────────────
 CLASSES = {
     0: "Data caries",
     1: "Gingivitis",
@@ -97,15 +95,12 @@ RECOMMENDATIONS = {
 
 NUM_CLASSES = len(CLASSES)
 
-# ── Model ──────────────────────────────────────────────────────────────────────
-device = torch.device("cpu")  # Force CPU - no CUDA on Railway free plan
-
+device = torch.device("cpu")
 model = timm.create_model("efficientnet_b3", pretrained=False, num_classes=NUM_CLASSES)
 state_dict = torch.load("tooth_model.pth", map_location=device, weights_only=False)
 model.load_state_dict(state_dict)
 model.eval()
 
-# ── Transform ──────────────────────────────────────────────────────────────────
 transform = transforms.Compose([
     transforms.Resize((300, 300)),
     transforms.ToTensor(),
@@ -113,32 +108,25 @@ transform = transforms.Compose([
                          std=[0.229, 0.224, 0.225]),
 ])
 
-# ── Lightweight CAM (no backward pass) ────────────────────────────────────────
+
 def get_cam(tensor: torch.Tensor, class_idx: int) -> np.ndarray:
-    """Score-weighted activation map using last conv block — no gradients needed."""
     activations = None
 
     def hook(module, input, output):
         nonlocal activations
         activations = output.detach()
 
-    # Hook last conv layer
     handle = model.blocks[-1][-1].conv_pwl.register_forward_hook(hook)
-
     with torch.no_grad():
-        logits = model(tensor)
-        probs = torch.softmax(logits, dim=1)[0]
-
+        model(tensor)
     handle.remove()
 
-    # Weight channels by classifier weights for predicted class
-    classifier_weights = model.classifier.weight[class_idx].detach()  # (C,)
-    # activations shape: (1, C, H, W)
+    classifier_weights = model.classifier.weight[class_idx].detach()
     cam = (classifier_weights[:, None, None] * activations[0]).sum(dim=0)
     cam = F.relu(cam)
     cam = cam - cam.min()
     cam = cam / (cam.max() + 1e-8)
-    return cam.numpy(), probs
+    return cam.numpy()
 
 
 def apply_heatmap(original_image: Image.Image, cam: np.ndarray) -> str:
@@ -154,25 +142,15 @@ def apply_heatmap(original_image: Image.Image, cam: np.ndarray) -> str:
     return base64.b64encode(buffer).decode("utf-8")
 
 
-# ── Shared predict logic ───────────────────────────────────────────────────────
 def run_predict(image_bytes: bytes, with_gradcam: bool = False):
     image = Image.open(io.BytesIO(image_bytes)).convert("RGB")
     tensor = transform(image).unsqueeze(0)
 
-    if with_gradcam:
-        cam, probs = get_cam(tensor, int(torch.no_grad() or 0))
-        # Re-run to get probs cleanly
-        with torch.no_grad():
-            logits = model(tensor)
-            probs = torch.softmax(logits, dim=1)[0]
-        top_idx = int(probs.argmax())
-        cam, _ = get_cam(tensor, top_idx)
-    else:
-        with torch.no_grad():
-            logits = model(tensor)
-            probs = torch.softmax(logits, dim=1)[0]
-        top_idx = int(probs.argmax())
+    with torch.no_grad():
+        logits = model(tensor)
+        probs = torch.softmax(logits, dim=1)[0]
 
+    top_idx = int(probs.argmax())
     top_label = CLASSES[top_idx]
     top_conf = float(probs[top_idx])
     all_probs = {CLASSES[i]: round(float(probs[i]), 4) for i in range(NUM_CLASSES)}
@@ -187,12 +165,12 @@ def run_predict(image_bytes: bytes, with_gradcam: bool = False):
     }
 
     if with_gradcam:
+        cam = get_cam(tensor, top_idx)
         result["gradcam_image"] = f"data:image/jpeg;base64,{apply_heatmap(image, cam)}"
 
     return result
 
 
-# ── Routes ─────────────────────────────────────────────────────────────────────
 @app.get("/")
 def root():
     return {"message": "Tooth Classification API is running 🦷"}
