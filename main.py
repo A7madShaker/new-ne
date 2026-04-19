@@ -5,7 +5,6 @@ import timm
 import numpy as np
 from PIL import Image
 from fastapi import FastAPI, File, UploadFile, HTTPException
-from fastapi.responses import JSONResponse
 from torchvision import transforms
 import torch.nn.functional as F
 
@@ -99,12 +98,11 @@ RECOMMENDATIONS = {
 NUM_CLASSES = len(CLASSES)
 
 # ── Model ──────────────────────────────────────────────────────────────────────
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+device = torch.device("cpu")  # Force CPU - no CUDA on Railway free plan
 
 model = timm.create_model("efficientnet_b3", pretrained=False, num_classes=NUM_CLASSES)
 state_dict = torch.load("tooth_model.pth", map_location=device, weights_only=False)
 model.load_state_dict(state_dict)
-model.to(device)
 model.eval()
 
 # ── Transform ──────────────────────────────────────────────────────────────────
@@ -115,77 +113,66 @@ transform = transforms.Compose([
                          std=[0.229, 0.224, 0.225]),
 ])
 
-# ── Grad-CAM ───────────────────────────────────────────────────────────────────
-class GradCAM:
-    def __init__(self, model):
-        self.model = model
-        self.gradients = None
-        self.activations = None
-        # Hook on the last conv block of EfficientNet-B3
-        target_layer = model.blocks[-1][-1].conv_pwl
-        target_layer.register_forward_hook(self._save_activation)
-        target_layer.register_backward_hook(self._save_gradient)
+# ── Lightweight CAM (no backward pass) ────────────────────────────────────────
+def get_cam(tensor: torch.Tensor, class_idx: int) -> np.ndarray:
+    """Score-weighted activation map using last conv block — no gradients needed."""
+    activations = None
 
-    def _save_activation(self, module, input, output):
-        self.activations = output.detach()
+    def hook(module, input, output):
+        nonlocal activations
+        activations = output.detach()
 
-    def _save_gradient(self, module, grad_input, grad_output):
-        self.gradients = grad_output[0].detach()
+    # Hook last conv layer
+    handle = model.blocks[-1][-1].conv_pwl.register_forward_hook(hook)
 
-    def generate(self, tensor, class_idx):
-        self.model.zero_grad()
-        output = self.model(tensor)
-        output[0, class_idx].backward()
+    with torch.no_grad():
+        logits = model(tensor)
+        probs = torch.softmax(logits, dim=1)[0]
 
-        # Global average pooling over gradients
-        weights = self.gradients.mean(dim=(2, 3), keepdim=True)
-        cam = (weights * self.activations).sum(dim=1, keepdim=True)
-        cam = F.relu(cam)
+    handle.remove()
 
-        # Normalize to [0, 1]
-        cam = cam - cam.min()
-        cam = cam / (cam.max() + 1e-8)
-        return cam.squeeze().cpu().numpy()
-
-
-gradcam = GradCAM(model)
+    # Weight channels by classifier weights for predicted class
+    classifier_weights = model.classifier.weight[class_idx].detach()  # (C,)
+    # activations shape: (1, C, H, W)
+    cam = (classifier_weights[:, None, None] * activations[0]).sum(dim=0)
+    cam = F.relu(cam)
+    cam = cam - cam.min()
+    cam = cam / (cam.max() + 1e-8)
+    return cam.numpy(), probs
 
 
 def apply_heatmap(original_image: Image.Image, cam: np.ndarray) -> str:
-    """Overlay Grad-CAM heatmap on original image and return base64 string."""
     import cv2
-
-    # Resize CAM to original image size
     orig_w, orig_h = original_image.size
     cam_resized = np.uint8(255 * cam)
     cam_resized = cv2.resize(cam_resized, (orig_w, orig_h))
-
-    # Apply colormap
     heatmap = cv2.applyColorMap(cam_resized, cv2.COLORMAP_JET)
     heatmap = cv2.cvtColor(heatmap, cv2.COLOR_BGR2RGB)
-
-    # Blend with original
     orig_array = np.array(original_image.convert("RGB"))
     blended = cv2.addWeighted(orig_array, 0.5, heatmap, 0.5, 0)
-
-    # Encode to base64
     _, buffer = cv2.imencode(".jpg", cv2.cvtColor(blended, cv2.COLOR_RGB2BGR))
     return base64.b64encode(buffer).decode("utf-8")
 
 
-# ── Helpers ────────────────────────────────────────────────────────────────────
+# ── Shared predict logic ───────────────────────────────────────────────────────
 def run_predict(image_bytes: bytes, with_gradcam: bool = False):
     image = Image.open(io.BytesIO(image_bytes)).convert("RGB")
-    tensor = transform(image).unsqueeze(0).to(device)
+    tensor = transform(image).unsqueeze(0)
 
     if with_gradcam:
-        tensor.requires_grad_()
+        cam, probs = get_cam(tensor, int(torch.no_grad() or 0))
+        # Re-run to get probs cleanly
+        with torch.no_grad():
+            logits = model(tensor)
+            probs = torch.softmax(logits, dim=1)[0]
+        top_idx = int(probs.argmax())
+        cam, _ = get_cam(tensor, top_idx)
+    else:
+        with torch.no_grad():
+            logits = model(tensor)
+            probs = torch.softmax(logits, dim=1)[0]
+        top_idx = int(probs.argmax())
 
-    with torch.set_grad_enabled(with_gradcam):
-        logits = model(tensor)
-        probs = torch.softmax(logits, dim=1)[0]
-
-    top_idx = int(probs.argmax())
     top_label = CLASSES[top_idx]
     top_conf = float(probs[top_idx])
     all_probs = {CLASSES[i]: round(float(probs[i]), 4) for i in range(NUM_CLASSES)}
@@ -200,7 +187,6 @@ def run_predict(image_bytes: bytes, with_gradcam: bool = False):
     }
 
     if with_gradcam:
-        cam = gradcam.generate(tensor, top_idx)
         result["gradcam_image"] = f"data:image/jpeg;base64,{apply_heatmap(image, cam)}"
 
     return result
