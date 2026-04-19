@@ -140,9 +140,12 @@ def get_cam(tensor: torch.Tensor, class_idx: int) -> np.ndarray:
 
 
 def apply_heatmap(original_image: Image.Image, cam: np.ndarray) -> str:
+    # Resize original to max 512px to save RAM
+    original_image = original_image.convert("RGB")
+    original_image.thumbnail((512, 512), Image.BILINEAR)
     orig_w, orig_h = original_image.size
 
-    # Resize CAM to original image size using PIL
+    # Resize CAM to image size using PIL
     cam_pil = Image.fromarray((cam * 255).astype(np.uint8))
     cam_pil = cam_pil.resize((orig_w, orig_h), Image.BILINEAR)
     cam_resized = np.array(cam_pil) / 255.0
@@ -151,13 +154,13 @@ def apply_heatmap(original_image: Image.Image, cam: np.ndarray) -> str:
     heatmap = jet_colormap(cam_resized)
 
     # Blend with original
-    orig_array = np.array(original_image.convert("RGB"))
+    orig_array = np.array(original_image)
     blended = (orig_array * 0.5 + heatmap * 0.5).astype(np.uint8)
 
     # Encode to base64
     result_img = Image.fromarray(blended)
     buffer = io.BytesIO()
-    result_img.save(buffer, format="JPEG")
+    result_img.save(buffer, format="JPEG", quality=75)
     return base64.b64encode(buffer.getvalue()).decode("utf-8")
 
 
