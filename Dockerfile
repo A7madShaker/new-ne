@@ -2,35 +2,23 @@ FROM python:3.11-slim
 
 WORKDIR /app
 
-# System deps for opencv
-RUN apt-get update && apt-get install -y \
-    libgl1 \
-    libglib2.0-0 \
-    && rm -rf /var/lib/apt/lists/*
-
-# Install gdown to download from Google Drive
 RUN pip install --no-cache-dir gdown
 
-# Download model at build time
 RUN gdown "1upoYABMr3LvLXLq3ZZw0La1K0SlbPQoX" -O tooth_model.pth
 
-# Install CPU-only PyTorch
 RUN pip install --no-cache-dir \
     torch==2.2.2+cpu \
     torchvision==0.17.2+cpu \
     --index-url https://download.pytorch.org/whl/cpu
 
-# Install remaining dependencies
 RUN pip install --no-cache-dir \
     fastapi \
     "uvicorn[standard]" \
     timm \
     pillow \
     python-multipart \
-    opencv-python-headless \
     "numpy<2"
 
-# Copy app
 COPY main.py .
 
 EXPOSE $PORT

@@ -109,22 +109,30 @@ transform = transforms.Compose([
 ])
 
 
+def jet_colormap(cam: np.ndarray) -> np.ndarray:
+    """Pure numpy JET colormap — no OpenCV needed."""
+    cam = np.clip(cam, 0, 1)
+    r = np.clip(1.5 - np.abs(cam * 4 - 3), 0, 1)
+    g = np.clip(1.5 - np.abs(cam * 4 - 2), 0, 1)
+    b = np.clip(1.5 - np.abs(cam * 4 - 1), 0, 1)
+    heatmap = np.stack([r, g, b], axis=-1)
+    return (heatmap * 255).astype(np.uint8)
+
+
 def get_cam(tensor: torch.Tensor, class_idx: int) -> np.ndarray:
     activations = None
 
     def hook(module, input, output):
         nonlocal activations
-        activations = output.detach()  # (1, C, H, W)
+        activations = output.detach()
 
-    # Hook the last conv block output (before global avg pool)
     handle = model.conv_head.register_forward_hook(hook)
     with torch.no_grad():
         model(tensor)
     handle.remove()
 
-    # activations: (1, 1536, H, W) — matches classifier weight dim
-    classifier_weights = model.classifier.weight[class_idx].detach()  # (1536,)
-    cam = (classifier_weights[:, None, None] * activations[0]).sum(dim=0)  # (H, W)
+    classifier_weights = model.classifier.weight[class_idx].detach()
+    cam = (classifier_weights[:, None, None] * activations[0]).sum(dim=0)
     cam = F.relu(cam)
     cam = cam - cam.min()
     cam = cam / (cam.max() + 1e-8)
@@ -132,16 +140,25 @@ def get_cam(tensor: torch.Tensor, class_idx: int) -> np.ndarray:
 
 
 def apply_heatmap(original_image: Image.Image, cam: np.ndarray) -> str:
-    import cv2
     orig_w, orig_h = original_image.size
-    cam_resized = np.uint8(255 * cam)
-    cam_resized = cv2.resize(cam_resized, (orig_w, orig_h))
-    heatmap = cv2.applyColorMap(cam_resized, cv2.COLORMAP_JET)
-    heatmap = cv2.cvtColor(heatmap, cv2.COLOR_BGR2RGB)
+
+    # Resize CAM to original image size using PIL
+    cam_pil = Image.fromarray((cam * 255).astype(np.uint8))
+    cam_pil = cam_pil.resize((orig_w, orig_h), Image.BILINEAR)
+    cam_resized = np.array(cam_pil) / 255.0
+
+    # Apply JET colormap
+    heatmap = jet_colormap(cam_resized)
+
+    # Blend with original
     orig_array = np.array(original_image.convert("RGB"))
-    blended = cv2.addWeighted(orig_array, 0.5, heatmap, 0.5, 0)
-    _, buffer = cv2.imencode(".jpg", cv2.cvtColor(blended, cv2.COLOR_RGB2BGR))
-    return base64.b64encode(buffer).decode("utf-8")
+    blended = (orig_array * 0.5 + heatmap * 0.5).astype(np.uint8)
+
+    # Encode to base64
+    result_img = Image.fromarray(blended)
+    buffer = io.BytesIO()
+    result_img.save(buffer, format="JPEG")
+    return base64.b64encode(buffer.getvalue()).decode("utf-8")
 
 
 def run_predict(image_bytes: bytes, with_gradcam: bool = False):
