@@ -94,8 +94,8 @@ RECOMMENDATIONS = {
 }
 
 NUM_CLASSES = len(CLASSES)
-
 device = torch.device("cpu")
+
 model = timm.create_model("efficientnet_b3", pretrained=False, num_classes=NUM_CLASSES)
 state_dict = torch.load("tooth_model.pth", map_location=device, weights_only=False)
 model.load_state_dict(state_dict)
@@ -120,23 +120,53 @@ def jet_colormap(cam: np.ndarray) -> np.ndarray:
 
 
 def get_cam(tensor: torch.Tensor, class_idx: int) -> np.ndarray:
-    activations = None
+    """
+    Proper Grad-CAM using the last EfficientNet block.
 
-    def hook(module, input, output):
-        nonlocal activations
-        activations = output.detach()
+    Fixes vs the original implementation:
+      1. Removed torch.no_grad() — gradients MUST flow for Grad-CAM.
+      2. Hook target changed from conv_head (wrong, tiny spatial map) to
+         model.blocks[-1] (last feature block, correct spatial resolution).
+      3. Weights computed via gradient global-average-pooling, not from
+         the classifier weight matrix (which is class-activation mapping,
+         not Grad-CAM, and gives wrong spatial attention for EfficientNet).
+    """
+    gradients = []
+    activations = []
 
-    handle = model.conv_head.register_forward_hook(hook)
-    with torch.no_grad():
-        model(tensor)
-    handle.remove()
+    def forward_hook(module, input, output):
+        activations.append(output)
 
-    classifier_weights = model.classifier.weight[class_idx].detach()
-    cam = (classifier_weights[:, None, None] * activations[0]).sum(dim=0)
+    def backward_hook(module, grad_input, grad_output):
+        gradients.append(grad_output[0])
+
+    # Hook the last feature block — has good spatial resolution
+    target_layer = model.blocks[-1]
+    fh = target_layer.register_forward_hook(forward_hook)
+    bh = target_layer.register_full_backward_hook(backward_hook)
+
+    # Forward pass — gradients must be enabled
+    tensor = tensor.clone().requires_grad_(True)
+    logits = model(tensor)
+
+    # Backward pass for the predicted class only
+    model.zero_grad()
+    score = logits[0, class_idx]
+    score.backward()
+
+    fh.remove()
+    bh.remove()
+
+    # Grad-CAM: weight each activation channel by its pooled gradient
+    grads = gradients[0][0]            # [C, H, W]
+    acts  = activations[0][0]          # [C, H, W]
+    weights = grads.mean(dim=(1, 2))   # Global Average Pool → [C]
+
+    cam = (weights[:, None, None] * acts).sum(dim=0)  # [H, W]
     cam = F.relu(cam)
     cam = cam - cam.min()
     cam = cam / (cam.max() + 1e-8)
-    return cam.numpy()
+    return cam.detach().numpy()
 
 
 def apply_heatmap(original_image: Image.Image, cam: np.ndarray) -> str:
@@ -170,12 +200,13 @@ def run_predict(image_bytes: bytes, with_gradcam: bool = False):
 
     with torch.no_grad():
         logits = model(tensor)
-        probs = torch.softmax(logits, dim=1)[0]
 
+    probs = torch.softmax(logits, dim=1)[0]
     top_idx = int(probs.argmax())
     top_label = CLASSES[top_idx]
     top_conf = float(probs[top_idx])
     all_probs = {CLASSES[i]: round(float(probs[i]), 4) for i in range(NUM_CLASSES)}
+
     clinical = RECOMMENDATIONS[top_label]
 
     result = {
@@ -187,6 +218,7 @@ def run_predict(image_bytes: bytes, with_gradcam: bool = False):
     }
 
     if with_gradcam:
+        # Grad-CAM needs its own forward+backward pass (cannot reuse no_grad pass)
         cam = get_cam(tensor, top_idx)
         result["gradcam_image"] = f"data:image/jpeg;base64,{apply_heatmap(image, cam)}"
 
