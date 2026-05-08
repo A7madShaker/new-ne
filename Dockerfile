@@ -21,6 +21,8 @@ RUN pip install --no-cache-dir \
 
 COPY main.py .
 
-EXPOSE $PORT
+EXPOSE 8000
 
-CMD uvicorn main:app --host 0.0.0.0 --port $PORT
+# Use shell form CMD so $PORT is expanded by /bin/sh at runtime.
+# Falls back to port 8000 if $PORT is not set (e.g. local dev).
+CMD ["sh", "-c", "uvicorn main:app --host 0.0.0.0 --port ${PORT:-8000}"]
